@@ -1,0 +1,105 @@
+name: Test & build Docker image
+
+on:
+  push:
+    branches: [master]
+    tags: ["*"]
+  pull_request:
+  schedule:
+    - cron: "0 2 * * 6"
+
+env:
+  IMAGE_NAME: trafex/php-nginx
+  IMAGE_TAG: ${{ github.sha }}
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        run: |-
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VERSION=${{ github.ref_name }} \
+            -t $IMAGE_NAME:$IMAGE_TAG .
+
+      - name: Smoke test image
+        run: |-
+          docker compose -f docker-compose.test.yml up -d app
+          sleep 2
+          docker compose -f docker-compose.test.yml run sut
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "template"
+          template: "@/contrib/sarif.tpl"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule')
+        uses: github/codeql-action/upload-sarif@v4.39.3
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Login to Docker Hub
+        if: (github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule' )) || contains(github.ref, 'refs/tags/')
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build multi-arch image and push latest tag
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule')
+        run: |-
+          docker buildx build \
+            --cache-from=$IMAGE_NAME:latest \
+            --push \
+            -t $IMAGE_NAME:latest \
+            --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6 \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VERSION=latest \
+            .
+
+      - name: Parse version components
+        if: contains(github.ref, 'refs/tags/')
+        id: parse_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "FULL_VERSION=$VERSION" >> $GITHUB_ENV
+          # Extract major version (e.g., 3 from 3.9.1)
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          echo "MAJOR_VERSION=$MAJOR" >> $GITHUB_ENV
+          # Extract minor version (e.g., 3.9 from 3.9.1)
+          MINOR=$(echo $VERSION | cut -d. -f1,2)
+          echo "MINOR_VERSION=$MINOR" >> $GITHUB_ENV
+
+      - name: Build multi-arch image and push release tags
+        if: contains(github.ref, 'refs/tags/')
+        run: |-
+          docker buildx build \
+            --cache-from=$IMAGE_NAME:latest \
+            --push \
+            -t $IMAGE_NAME:$FULL_VERSION \
+            -t $IMAGE_NAME:$MINOR_VERSION \
+            -t $IMAGE_NAME:$MAJOR_VERSION \
+            --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6 \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VERSION=$FULL_VERSION \
+            .
